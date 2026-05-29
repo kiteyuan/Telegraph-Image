@@ -56,9 +56,7 @@ export async function onRequest(context) {
                 });
 
                 if (moderation?.shouldBlock) {
-                    const referer = request.headers.get('Referer');
-                    const redirectUrl = referer ? "https://static-res.pages.dev/teleimage/img-block-compressed.png" : `${url.origin}/block-img.html`;
-                    return Response.redirect(redirectUrl, 302);
+                    return Response.redirect(getBlockedRedirectUrl(request, url), 302);
                 }
             } catch (error) {
                 console.error("Error during content moderation: " + error.message);
@@ -99,9 +97,7 @@ export async function onRequest(context) {
     if (metadata.ListType === "White") {
         return response;
     } else if (metadata.ListType === "Block" || metadata.Label === "adult") {
-        const referer = request.headers.get('Referer');
-        const redirectUrl = referer ? "https://static-res.pages.dev/teleimage/img-block-compressed.png" : `${url.origin}/block-img.html`;
-        return Response.redirect(redirectUrl, 302);
+        return Response.redirect(getBlockedRedirectUrl(request, url), 302);
     }
 
     // Check if WhiteList_Mode is enabled
@@ -121,15 +117,12 @@ export async function onRequest(context) {
 
             if (moderation) {
                 const { label, shouldBlock } = moderation;
-
-                if (label) {
-                    metadata.Label = label;
-                }
+                metadata.Label = label;
 
                 if (shouldBlock) {
                     console.log("Content marked as adult, saving metadata and redirecting");
                     await env.img_url.put(params.id, "", { metadata });
-                    return Response.redirect(`${url.origin}/block-img.html`, 302);
+                    return Response.redirect(getBlockedRedirectUrl(request, url), 302);
                 }
             }
         } catch (error) {
@@ -193,7 +186,13 @@ function getSightengineConfig(env) {
 
 async function moderateWithSightengine({ response, sightengine, fileName }) {
     const contentType = response.headers.get("content-type") || "";
-    if (!contentType.toLowerCase().startsWith("image/")) return null;
+    if (!isImageResponse(contentType, fileName)) {
+        console.log("Skipping content moderation because response is not detected as an image", {
+            contentType,
+            fileName,
+        });
+        return null;
+    }
 
     const buf = await response.clone().arrayBuffer();
     if (!buf || buf.byteLength === 0) return null;
@@ -216,9 +215,12 @@ async function moderateWithSightengine({ response, sightengine, fileName }) {
     }
 
     const data = await res.json();
+    if (data?.status !== "success") {
+        console.error("Content moderation API returned non-success status:", data);
+    }
     const decision = evaluateSightengineResult(data, sightengine);
     return {
-        label: decision.isAdult ? "adult" : null,
+        label: decision.isAdult ? "adult" : "safe",
         shouldBlock: decision.isAdult,
         details: decision.details,
     };
@@ -248,4 +250,25 @@ function evaluateSightengineResult(data, sightengine) {
             threshold: sightengine.explicitThreshold,
         },
     };
+}
+
+function getBlockedRedirectUrl(request, url) {
+    const referer = request.headers.get('Referer');
+    return referer ? "https://static-res.pages.dev/teleimage/img-block-compressed.png" : `${url.origin}/block-img.html`;
+}
+
+function isImageResponse(contentType, fileName) {
+    if (contentType.toLowerCase().startsWith("image/")) return true;
+
+    const lowerFileName = (fileName || "").toLowerCase();
+    return [
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".webp",
+        ".bmp",
+        ".avif",
+        ".svg",
+    ].some((ext) => lowerFileName.endsWith(ext));
 }
