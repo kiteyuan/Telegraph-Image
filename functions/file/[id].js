@@ -42,10 +42,30 @@ export async function onRequest(context) {
         return response;
     }
 
+    const sightengine = getSightengineConfig(env);
+
     // Check if KV storage is available
     if (!env.img_url) {
+        if (sightengine && request.method === "GET") {
+            try {
+                console.log("Starting content moderation...");
+                const moderation = await moderateWithSightengine({
+                    response,
+                    sightengine,
+                    fileName: params.id,
+                });
+
+                if (moderation?.shouldBlock) {
+                    const referer = request.headers.get('Referer');
+                    const redirectUrl = referer ? "https://static-res.pages.dev/teleimage/img-block-compressed.png" : `${url.origin}/block-img.html`;
+                    return Response.redirect(redirectUrl, 302);
+                }
+            } catch (error) {
+                console.error("Error during content moderation: " + error.message);
+            }
+        }
         console.log("KV storage not available, returning image directly");
-        return response;  // Directly return image response, terminate execution
+        return response;
     }
 
     // The following code executes only if KV is available
@@ -90,7 +110,6 @@ export async function onRequest(context) {
     }
 
     // If no metadata or further actions required, moderate content and add to KV if needed
-    const sightengine = getSightengineConfig(env);
     if (sightengine && request.method === "GET") {
         try {
             console.log("Starting content moderation...");
