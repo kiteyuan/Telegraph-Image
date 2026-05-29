@@ -90,26 +90,27 @@ export async function onRequest(context) {
     }
 
     // If no metadata or further actions required, moderate content and add to KV if needed
-    if (env.ModerateContentApiKey) {
+    const sightengine = getSightengineConfig(env);
+    if (sightengine && request.method === "GET") {
         try {
             console.log("Starting content moderation...");
-            const moderateUrl = `https://api.moderatecontent.com/moderate/?key=${env.ModerateContentApiKey}&url=https://telegra.ph${url.pathname}${url.search}`;
-            const moderateResponse = await fetch(moderateUrl);
+            const moderation = await moderateWithSightengine({
+                response,
+                sightengine,
+                fileName: params.id,
+            });
 
-            if (!moderateResponse.ok) {
-                console.error("Content moderation API request failed: " + moderateResponse.status);
-            } else {
-                const moderateData = await moderateResponse.json();
-                console.log("Content moderation results:", moderateData);
+            if (moderation) {
+                const { label, shouldBlock } = moderation;
 
-                if (moderateData && moderateData.rating_label) {
-                    metadata.Label = moderateData.rating_label;
+                if (label) {
+                    metadata.Label = label;
+                }
 
-                    if (moderateData.rating_label === "adult") {
-                        console.log("Content marked as adult, saving metadata and redirecting");
-                        await env.img_url.put(params.id, "", { metadata });
-                        return Response.redirect(`${url.origin}/block-img.html`, 302);
-                    }
+                if (shouldBlock) {
+                    console.log("Content marked as adult, saving metadata and redirecting");
+                    await env.img_url.put(params.id, "", { metadata });
+                    return Response.redirect(`${url.origin}/block-img.html`, 302);
                 }
             }
         } catch (error) {
@@ -152,4 +153,80 @@ async function getFilePath(env, file_id) {
         console.error('Error fetching file path:', error.message);
         return null;
     }
+}
+
+function getSightengineConfig(env) {
+    const apiUser = env.SightengineApiUser || env.SIGHTENGINE_API_USER;
+    const apiSecret = env.SightengineApiSecret || env.SIGHTENGINE_API_SECRET;
+    if (!apiUser || !apiSecret) return null;
+
+    const models = env.SightengineModels || env.SIGHTENGINE_MODELS || "nudity-2.1";
+    const explicitThresholdRaw = env.SightengineExplicitThreshold || env.SIGHTENGINE_EXPLICIT_THRESHOLD;
+    const explicitThreshold = explicitThresholdRaw !== undefined ? Number(explicitThresholdRaw) : 0.6;
+
+    return {
+        apiUser: String(apiUser),
+        apiSecret: String(apiSecret),
+        models: String(models),
+        explicitThreshold: Number.isFinite(explicitThreshold) ? explicitThreshold : 0.6,
+    };
+}
+
+async function moderateWithSightengine({ response, sightengine, fileName }) {
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.toLowerCase().startsWith("image/")) return null;
+
+    const buf = await response.clone().arrayBuffer();
+    if (!buf || buf.byteLength === 0) return null;
+
+    const form = new FormData();
+    const blob = new Blob([buf], { type: contentType || "application/octet-stream" });
+    form.append("media", blob, fileName || "image");
+    form.append("models", sightengine.models);
+    form.append("api_user", sightengine.apiUser);
+    form.append("api_secret", sightengine.apiSecret);
+
+    const res = await fetch("https://api.sightengine.com/1.0/check.json", {
+        method: "POST",
+        body: form,
+    });
+
+    if (!res.ok) {
+        console.error("Content moderation API request failed: " + res.status);
+        return null;
+    }
+
+    const data = await res.json();
+    const decision = evaluateSightengineResult(data, sightengine);
+    return {
+        label: decision.isAdult ? "adult" : null,
+        shouldBlock: decision.isAdult,
+        details: decision.details,
+    };
+}
+
+function evaluateSightengineResult(data, sightengine) {
+    if (!data || data.status !== "success") {
+        return { isAdult: false, details: null };
+    }
+
+    const nudity = data.nudity;
+    if (!nudity) return { isAdult: false, details: null };
+
+    const sexualActivity = Number(nudity.sexual_activity) || 0;
+    const sexualDisplay = Number(nudity.sexual_display) || 0;
+    const erotica = Number(nudity.erotica) || 0;
+
+    const maxExplicit = Math.max(sexualActivity, sexualDisplay, erotica);
+    const isAdult = maxExplicit >= sightengine.explicitThreshold;
+
+    return {
+        isAdult,
+        details: {
+            sexual_activity: sexualActivity,
+            sexual_display: sexualDisplay,
+            erotica,
+            threshold: sightengine.explicitThreshold,
+        },
+    };
 }
