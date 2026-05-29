@@ -44,9 +44,20 @@ export async function onRequestPost(context) {
         }
 
         const fileId = getFileId(result.data);
+        const sightengine = getSightengineConfig(env);
+        let statusKey = "none";
 
         if (!fileId) {
             throw new Error('Failed to get file ID');
+        }
+
+        if (uploadFile.type.startsWith('image/') && sightengine) {
+            try {
+                console.log('Starting upload-time content moderation...');
+                statusKey = await moderateUploadedImage(uploadFile, sightengine);
+            } catch (error) {
+                console.error('Upload-time moderation error:', error);
+            }
         }
 
         // 将文件信息保存到 KV 存储
@@ -55,7 +66,7 @@ export async function onRequestPost(context) {
                 metadata: {
                     TimeStamp: Date.now(),
                     ListType: "None",
-                    Label: "None",
+                    Label: statusKey,
                     liked: false,
                     fileName: fileName,
                     fileSize: uploadFile.size,
@@ -64,7 +75,10 @@ export async function onRequestPost(context) {
         }
 
         return new Response(
-            JSON.stringify([{ 'src': `/file/${fileId}.${fileExtension}` }]),
+            JSON.stringify([{
+                src: `/file/${fileId}.${fileExtension}`,
+                statusKey,
+            }]),
             {
                 status: 200,
                 headers: { 'Content-Type': 'application/json' }
@@ -131,4 +145,64 @@ async function sendToTelegram(formData, apiEndpoint, env, retryCount = 0) {
         }
         return { success: false, error: 'Network error occurred' };
     }
+}
+
+function getSightengineConfig(env) {
+    const apiUser = env.SightengineApiUser || env.SIGHTENGINE_API_USER;
+    const apiSecret = env.SightengineApiSecret || env.SIGHTENGINE_API_SECRET;
+    if (!apiUser || !apiSecret) return null;
+
+    const models = env.SightengineModels || env.SIGHTENGINE_MODELS || "nudity-2.1";
+    const explicitThresholdRaw = env.SightengineExplicitThreshold || env.SIGHTENGINE_EXPLICIT_THRESHOLD;
+    const explicitThreshold = explicitThresholdRaw !== undefined ? Number(explicitThresholdRaw) : 0.6;
+
+    return {
+        apiUser: String(apiUser),
+        apiSecret: String(apiSecret),
+        models: String(models),
+        explicitThreshold: Number.isFinite(explicitThreshold) ? explicitThreshold : 0.6,
+    };
+}
+
+async function moderateUploadedImage(file, sightengine) {
+    const form = new FormData();
+    form.append("media", file, file.name || "image");
+    form.append("models", sightengine.models);
+    form.append("api_user", sightengine.apiUser);
+    form.append("api_secret", sightengine.apiSecret);
+
+    const res = await fetch("https://api.sightengine.com/1.0/check.json", {
+        method: "POST",
+        body: form,
+    });
+
+    if (!res.ok) {
+        console.error("Upload-time moderation API request failed: " + res.status);
+        return "none";
+    }
+
+    const data = await res.json();
+    if (data?.status !== "success") {
+        console.error("Upload-time moderation API returned non-success status:", data);
+        return "none";
+    }
+
+    return evaluateSightengineResult(data, sightengine).isAdult ? "adult" : "safe";
+}
+
+function evaluateSightengineResult(data, sightengine) {
+    if (!data || data.status !== "success") {
+        return { isAdult: false };
+    }
+
+    const nudity = data.nudity;
+    if (!nudity) return { isAdult: false };
+
+    const sexualActivity = Number(nudity.sexual_activity) || 0;
+    const sexualDisplay = Number(nudity.sexual_display) || 0;
+    const erotica = Number(nudity.erotica) || 0;
+
+    return {
+        isAdult: Math.max(sexualActivity, sexualDisplay, erotica) >= sightengine.explicitThreshold,
+    };
 }
