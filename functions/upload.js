@@ -74,11 +74,19 @@ export async function onRequestPost(context) {
             });
         }
 
+        const responseItem = {
+            statusKey,
+        };
+
+        if (statusKey === "adult") {
+            responseItem.message = "图片涉嫌违规";
+            responseItem.src = null;
+        } else {
+            responseItem.src = `/file/${fileId}.${fileExtension}`;
+        }
+
         return new Response(
-            JSON.stringify([{
-                src: `/file/${fileId}.${fileExtension}`,
-                statusKey,
-            }]),
+            JSON.stringify([responseItem]),
             {
                 status: 200,
                 headers: { 'Content-Type': 'application/json' }
